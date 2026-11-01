@@ -1,0 +1,10 @@
+fastapi==0.118.0
+uvicorn[standard]==0.37.0
+python-multipart==0.0.20
+pillow==11.3.0
+qrcode==8.2
+httpx==0.28.1
+pytest==8.4.2
+numpy==2.5.3
+opencv-python-headless==5.0.0.93
+onnxruntime==1.30.0

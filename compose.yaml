@@ -1,0 +1,28 @@
+# Fundus server -- see README.md
+services:
+  fundus:
+    build: ./server
+    image: fundus-server:local
+    container_name: fundus
+    restart: unless-stopped
+    ports:
+      - "8095:8095"
+    volumes:
+      # Database and photos. Back up this folder.
+      - ./data:/daten
+    environment:
+      TZ: ${TZ:-Europe/Berlin}
+      # Password for the app, used on the very first start only (then stored hashed in the database)
+      PASSWORT: ${PASSWORT:?Set PASSWORT in .env}
+      # Optional: OpenAI key for image recognition. Leave empty and enter it in the app instead (More → Image recognition).
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    # Removing backgrounds ("Optimize photos") needs about 1.1 GB while it runs; one photo at a time.
+    mem_limit: 2g
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8095/api/gesundheit')"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
