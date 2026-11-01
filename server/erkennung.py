@@ -135,12 +135,12 @@ def anweisung_en(bereiche: list[str]) -> str:
 def _demo_vorschlag(en: bool) -> tuple[dict, dict]:
     """Feste Antwort für den Demo-Server: keine Kosten, kein Schlüssel nötig. Steht so auch im Text für die Prüfer."""
     if en:
-        v = {"name": "Wago lever connector 221-413 (demo)", "beschreibung":
+        v = {"name": "Lever connector, 3-pole (demo)", "beschreibung":
              "Demo server: every photo gets this sample answer. With your own server and OpenAI key the real "
              "recognition answers here.", "bereich": "Electrical", "menge": "about 10",
              "woerter": ["connector", "terminal block", "lever clamp", "wiring", "junction"], "sicherheit": "mittel"}
     else:
-        v = {"name": "Wago-Hebelklemme 221-413 (Demo)", "beschreibung":
+        v = {"name": "Hebelklemme 3-polig (Demo)", "beschreibung":
              "Demo-Server: Jedes Foto bekommt diese Beispielantwort. Mit eigenem Server und OpenAI-Schlüssel "
              "antwortet hier die echte Erkennung.", "bereich": "Elektro", "menge": "ca. 10",
              "woerter": ["verbindungsklemme", "lüsterklemme", "hebelklemme", "verdrahten", "abzweig"],
