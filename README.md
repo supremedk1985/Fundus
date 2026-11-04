@@ -20,6 +20,8 @@ only to the server address you enter. There is no account with the developer and
   points out when the same thing already lies in a box (same type designation or name)
 - **Tidy up**: possible duplicates to merge (quantities and photos are added up), boxes without a place, a finer split of
   overfull categories proposed by the AI (database backup first), spec sheets for older items
+- **Check names**: the AI looks at every photo together with its name and suggests a better name only where the
+  old one is wrong; you accept or keep each suggestion
 - **Build**: describe a project idea, the AI picks the parts list from your inventory, lists what is missing and which boxes
   to fetch; keep it as a project
 - **Shop links**: share a product link from a shop app, the server reads title, photo and details
@@ -131,7 +133,7 @@ einen Reverse Proxy mit HTTPS stellen (Beispiel oben) und diese Adresse eintrage
 **Einstellungen → Bilderkennung** (Zahnrad oben) eintragen (wird nur auf deinem Server gespeichert) oder als `OPENAI_API_KEY` in die `.env`.
 Ohne Schlüssel trägst du Sachen von Hand ein. Mit Schlüssel erkennt der Server auch einen kurzen **Steckbrief** je Sache,
 schlägt beim **Aufräumen** eine feinere Einteilung vor und stellt beim **Bauen** aus einer Projektidee die Stückliste aus
-deinem Bestand zusammen (dafür gehen Namen, Mengen und Arten als Text an OpenAI).
+deinem Bestand zusammen (dafür gehen Namen, Mengen und Arten als Text an OpenAI). **Namen prüfen** zeigt jedes Foto mit seinem Namen noch einmal der KI und schlägt nur dort einen besseren Namen vor, wo der alte nicht passt.
 
 **Neu in Fundus 2:** Einräumen am Fließband (viele Fotos hintereinander, erkannt wird nebenher, „liegt schon in K-06 →
 dazulegen?“), Aufräumen (Doppeltes zusammenlegen, Kisten ohne Platz), Bauen, neue Fotos automatisch zugeschnitten und
