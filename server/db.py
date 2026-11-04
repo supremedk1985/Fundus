@@ -172,6 +172,11 @@ def einrichten(erstpasswort: str | None) -> None:
     # „Sind verschieden" aus der Aufräumliste: diese Gruppe nicht wieder als vielleicht doppelt zeigen -- solange
     # sie aus genau denselben Sachen besteht (kommt eine dazu, erscheint sie wieder).
     V.execute("CREATE TABLE IF NOT EXISTS nicht_doppelt (schluessel TEXT PRIMARY KEY, ids TEXT NOT NULL, am TEXT NOT NULL)")
+    # Namen prüfen (04.11.2026): je Sache das Ergebnis der letzten Prüfung. `alt` = der Name, der geprüft wurde --
+    # ändert er sich, gilt die Sache wieder als ungeprüft. stand: passt | offen | uebernommen | behalten
+    V.execute("""CREATE TABLE IF NOT EXISTS namenspruefung (sache_id INTEGER PRIMARY KEY, alt TEXT NOT NULL,
+                 name TEXT NOT NULL DEFAULT '', beschreibung TEXT NOT NULL DEFAULT '', grund TEXT NOT NULL DEFAULT '',
+                 sicherheit TEXT NOT NULL DEFAULT '', stand TEXT NOT NULL, am TEXT NOT NULL)""")
     # Einstellungen, die man in der App ändern kann (01.11.2026): der OpenAI-Schlüssel und das Modell.
     V.execute("CREATE TABLE IF NOT EXISTS einstellungen (schluessel TEXT PRIMARY KEY, wert TEXT NOT NULL)")
     if erstpasswort and not V.execute("SELECT 1 FROM konto").fetchone():

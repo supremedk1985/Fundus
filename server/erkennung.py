@@ -211,18 +211,28 @@ def _frage(hinweis: str, produkttext: str, en: bool) -> str:
     return frage
 
 
+_UNSICHTBAR = str.maketrans({"\u00ad": None, "\u200b": None, "\u200c": None, "\u200d": None, "\ufeff": None,
+                             "\u00a0": " "})
+
+
+def ohne_unsichtbare(text) -> str:
+    """Weiche Trennstriche und andere unsichtbare Zeichen raus (04.11.2026: ein Name kam als
+    „Wasser\u00adspar\u00adstrah\u00adler" und stand so in der App)."""
+    return str(text or "").translate(_UNSICHTBAR).strip()
+
+
 def bereinigen(v) -> dict:
     """Eine Antwort ohne festes Schema (Claude) in die Form der OpenAI-Antwort bringen -- oder ablehnen."""
     if not isinstance(v, dict):
         raise _KeinClaude("Antwort ist kein Objekt")
-    name = str(v.get("name") or "").strip()
+    name = ohne_unsichtbare(v.get("name"))
     if not name:
         raise _KeinClaude("Antwort ohne Namen")
     woerter = v.get("woerter") or []
     if isinstance(woerter, str):
         woerter = woerter.split(",")
     sicherheit = str(v.get("sicherheit") or "").strip().lower()
-    return {"name": name[:120], "beschreibung": str(v.get("beschreibung") or "").strip()[:600],
+    return {"name": name[:120], "beschreibung": ohne_unsichtbare(v.get("beschreibung"))[:600],
             "bereich": str(v.get("bereich") or "").strip()[:40], "menge": str(v.get("menge") or "").strip()[:60],
             "woerter": [str(w) for w in woerter if str(w).strip()][:15],
             "sicherheit": sicherheit if sicherheit in ("hoch", "mittel", "niedrig") else "mittel",
@@ -283,9 +293,11 @@ def _claude(bildpfade: list[str], bereiche: list[str], frage: str, en: bool, cli
 
 
 def frage_json(system: str, text: str, schema: dict, name: str, client: httpx.Client | None = None,
-               zeit: float = 150) -> tuple[dict, dict]:
-    """Eine Textfrage mit JSON-Antwort (Bauen, Arten, Steckbriefe; 03.11.2026): erst Claude, sonst OpenAI mit festem
-    Schema. Gibt (antwort, nutzung wie bei erkennen) zurück; Fehler als ErkennungsFehler."""
+               zeit: float = 150, bildpfade: list[str] | None = None) -> tuple[dict, dict]:
+    """Eine Frage mit JSON-Antwort (Bauen, Arten, Steckbriefe; 03.11.2026; seit 04.11. auch mit Fotos: Namen prüfen):
+    erst Claude, sonst OpenAI mit festem Schema. Gibt (antwort, nutzung wie bei erkennen) zurück; Fehler als
+    ErkennungsFehler."""
+    bildpfade = bildpfade or []
     if demo():
         raise ErkennungsFehler("Auf dem Demo-Server gibt es diese KI-Hilfe nicht.", 503)
     versuche: list[dict] = []
@@ -296,7 +308,8 @@ def frage_json(system: str, text: str, schema: dict, name: str, client: httpx.Cl
             try:
                 antwort, nutzung = _claude_rufen(system + "\n\nAntworte AUSSCHLIESSLICH mit einem JSON-Objekt nach diesem "
                                                  "Schema, ohne Zaun und ohne Text davor oder danach:\n"
-                                                 + json.dumps(schema, ensure_ascii=False), text, [], c, zeit)
+                                                 + json.dumps(schema, ensure_ascii=False), text,
+                                                 [_bild_als_daten_url(p).split(",", 1)[1] for p in bildpfade], c, zeit)
                 if not isinstance(antwort, dict):
                     raise _KeinClaude("Antwort ist kein Objekt")
                 nutzung.update(versuche=[], rueckfall="")
@@ -305,7 +318,11 @@ def frage_json(system: str, text: str, schema: dict, name: str, client: httpx.Cl
                 versuche.append({"modell": f"claude-{claude_modell()}", "grund": k.grund})
         if not schluessel():
             raise ErkennungsFehler("Die KI ist nicht eingerichtet oder gerade nicht erreichbar.", 503, versuche)
-        anfrage = {"model": modell(), "messages": [{"role": "system", "content": system}, {"role": "user", "content": text}],
+        inhalt: str | list = text
+        if bildpfade:
+            inhalt = [{"type": "text", "text": text}] + [
+                {"type": "image_url", "image_url": {"url": _bild_als_daten_url(p), "detail": "auto"}} for p in bildpfade]
+        anfrage = {"model": modell(), "messages": [{"role": "system", "content": system}, {"role": "user", "content": inhalt}],
                    "response_format": {"type": "json_schema", "json_schema": {"name": name, "strict": True, "schema": schema}}}
         try:
             r = c.post(API, json=anfrage, headers={"Authorization": f"Bearer {schluessel()}"}, timeout=zeit)
@@ -398,6 +415,8 @@ def _openai(bildpfade: list[str], frage: str, bereiche: list[str], en: bool, c: 
         vorschlag = json.loads(d["choices"][0]["message"]["content"])
     except (KeyError, IndexError, TypeError, ValueError):
         raise ErkennungsFehler("Die Antwort der Bilderkennung war unlesbar.", 502)
+    vorschlag["name"] = ohne_unsichtbare(vorschlag.get("name"))
+    vorschlag["beschreibung"] = ohne_unsichtbare(vorschlag.get("beschreibung"))
     nutzung = d.get("usage") or {}
     vorschlag["woerter"] = sorted({w.strip().lower() for w in vorschlag.get("woerter", []) if w.strip()})
     vorschlag["merkmale"] = merkmale_glaetten(vorschlag.get("merkmale"))

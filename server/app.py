@@ -1023,16 +1023,22 @@ def _sache_json(s, kiste=None) -> dict:
                 if z["neu"] in _fotoliste(s)}}
 
 
+def _sauber(text) -> str:
+    """Ohne weiche Trennstriche und andere unsichtbare Zeichen (04.11.2026: „Wasser\u00adspar\u00adstrah\u00adler" kam so aus einer
+    Erkennung und stand als „Wasser-spar-strah-ler" in der App; die Suche fand „Wassersparstrahler" nicht)."""
+    return erkennung.ohne_unsichtbare(text)
+
+
 def _felder(daten: dict, pflicht: bool) -> dict:
     f = {}
     if pflicht or "name" in daten:
-        name = str(daten.get("name") or "").strip()[:120]
+        name = _sauber(daten.get("name"))[:120]
         if not name:
             raise HTTPException(422, "Die Sache braucht einen Namen")
         f["name"] = name
     for feld, laenge in (("beschreibung", 500), ("bereich", 40), ("menge", 40), ("link", 300), ("notiz", 1000)):
         if feld in daten or pflicht:
-            f[feld] = str(daten.get(feld) or "").strip()[:laenge]
+            f[feld] = _sauber(daten.get(feld))[:laenge]
     if "bereich" in f:
         f["bereich"] = bereich_glaetten(f["bereich"])
     if "merkmale" in daten:
@@ -1041,7 +1047,7 @@ def _felder(daten: dict, pflicht: bool) -> dict:
         ws = daten.get("woerter") or []
         if not isinstance(ws, list):
             raise HTTPException(422, "woerter muss eine Liste sein")
-        f["woerter"] = json.dumps(sorted({str(w).strip().lower()[:40] for w in ws if str(w).strip()})[:30],
+        f["woerter"] = json.dumps(sorted({_sauber(w).lower()[:40] for w in ws if _sauber(w)})[:30],
                                   ensure_ascii=False)
     return f
 
@@ -1640,6 +1646,12 @@ def _typen(name: str) -> set[str]:
     return {t.upper().replace("-", "").replace(" ", "") for t in _TYP.findall(name or "")} - _FAMILIEN
 
 
+def _wortmenge(name: str) -> set[str]:
+    """Wörter eines Namens, Zahl und Einheit getrennt („4mm²" → 4, mm), ohne Füllwörter."""
+    getrennt = re.sub(r"(\d)([^\d\s.,])", r"\1 \2", _sauber(name))
+    return {w for w in suche.woerter_von(getrennt) if w not in suche.FUELLWOERTER}
+
+
 def vielleicht_doppelt(sachen: list[dict], verworfen: dict[str, str]) -> list[dict]:
     """Gruppen, die wohl dieselbe Sache mehrfach erfasst sind (Befund 03.11.: dreimal FS1000A in K-06).
     Gleich heißt: gleicher Name (normalisiert) -- oder gleiche Typbezeichnung UND (gleiche Kiste oder sehr
@@ -1653,6 +1665,20 @@ def vielleicht_doppelt(sachen: list[dict], verworfen: dict[str, str]) -> list[di
         if n:
             gruppen.setdefault("name:" + n, {"grund": s["name"], "ids": []})["ids"].append(s["id"])
     nach_id = {s["id"]: s for s in lebend}
+    # Gleiche Wörter in anderer Reihenfolge (04.11.: „Solarkabel 4 mm², 3 m mit MC4-Steckern" / „Solarkabel mit
+    # MC4-Steckern 4mm² 3m"): Wortmengen fast gleich UND dieselben Zahlen -- „Lenkrolle 50 mm" ≠ „Lenkrolle 75 mm".
+    mengen = {s["id"]: _wortmenge(s["name"]) for s in lebend}
+    ids_ = sorted(mengen)
+    for k, a in enumerate(ids_):
+        for b in ids_[k + 1:]:
+            wa, wb = mengen[a], mengen[b]
+            if len(wa) < 3 or len(wb) < 3 or {w for w in wa if w.isdigit()} != {w for w in wb if w.isdigit()}:
+                continue
+            if len(wa & wb) / len(wa | wb) >= 0.8:
+                g = next((g for g in gruppen.values() if g.get("satz") and (a in g["ids"] or b in g["ids"])), None)
+                if g is None:
+                    g = gruppen.setdefault(f"satz:{a}", {"grund": nach_id[a]["name"], "ids": [], "satz": True})
+                g["ids"] += [a, b]
     fertig, belegt = [], set()
     for schluessel, g in sorted(gruppen.items(), key=lambda kv: (kv[0].startswith("typ:"), kv[0])):
         ids = sorted(set(g["ids"]))
@@ -1698,7 +1724,11 @@ def aufraeumen(x_token: str = Header(None)):
     return {"doppelt": doppelt, "ohne_platz": ohne_platz, "ohne_art": ohne_art, "raus": raus, "leer": leer,
             "arten": {"groesster": groesster["name"], "anteil": round(groesster["anzahl"] / gesamt, 2),
                       "lohnt": groesster["anzahl"] / gesamt > 0.5 and gesamt >= 20},
-            "ohne_merkmale": ohne_merkmale, "merkmale_laeuft": _merkmale_stand["laeuft"]}
+            "ohne_merkmale": ohne_merkmale, "merkmale_laeuft": _merkmale_stand["laeuft"],
+            # Namen prüfen (04.11.): offene Vorschläge, noch nie geprüfte Sachen, läuft gerade
+            "namen_offen": V.execute("""SELECT COUNT(*) n FROM namenspruefung n JOIN sachen s ON s.id = n.sache_id
+                                        WHERE n.stand = 'offen' AND n.alt = s.name""").fetchone()["n"],
+            "namen_ungeprueft": len(_namen_ungeprueft()), "namen_laeuft": _namen_stand["laeuft"]}
 
 
 @app.post("/api/doppelt/verschieden")
@@ -1911,6 +1941,160 @@ def merkmale_stand_lesen(x_token: str = Header(None)):
     return {**_merkmale_stand, "offen": V.execute("SELECT COUNT(*) n FROM sachen WHERE merkmale IS NULL").fetchone()["n"]}
 
 
+# ---------------------------------------------------------------- Namen prüfen
+
+# Daniel, 04.11.2026 („Mach alle 3"): Die ersten 250 Erkennungen machte gpt-4.1-mini, in der Probe 11 von 20 richtig.
+# Die Durchsicht der 186 Fotos fand u. a. „Lötzinn 0,35 mm²" (eine Litzenrolle), „SH3X Infrarot" (SHT3x Temp/Feuchte),
+# „DollaTek Mikrocontroller 5V Max 25V" (Spannungssensor). Hier sieht die KI jedes Foto mit dem jetzigen Namen noch
+# einmal an und schlägt nur dort etwas vor, wo der Name falsch oder irreführend ist. Übernommen wird erst auf Knopfdruck.
+NAMEN_SCHEMA = {"type": "object", "additionalProperties": False,
+                "required": ["passt", "name", "beschreibung", "grund", "sicherheit"],
+                "properties": {"passt": {"type": "boolean"}, "name": {"type": "string"},
+                               "beschreibung": {"type": "string"}, "grund": {"type": "string"},
+                               "sicherheit": {"type": "string", "enum": ["hoch", "mittel", "niedrig"]}}}
+NAMEN_ANWEISUNG = (
+    "Du prüfst Einträge im Kleinteile-Verzeichnis einer privaten Werkstatt. Du bekommst das Foto (oder zwei) einer "
+    "Sache und den bisherigen Eintrag. Frage nur: Benennt der Name die Sache auf dem Foto richtig?\n"
+    "- passt=true, wenn der Name stimmt. Stilfragen, fehlende Details oder eine andere Wortwahl sind KEIN Grund.\n"
+    "- passt=false nur, wenn der Name falsch oder irreführend ist: andere Sache, falscher Typ oder Sensor, falsche "
+    "Einheit, verwechselte Beschriftung, kaputte Schreibung. Dann name: der richtige Name auf Deutsch, höchstens 60 "
+    "Zeichen, mit Marke, Typbezeichnung oder Artikelnummer, wenn sie auf dem Foto lesbar ist; beschreibung: ein "
+    "kurzer Satz; grund: in wenigen Worten, was am alten Namen falsch ist.\n"
+    "- Was der Besitzer selbst hineingeschrieben hat, ist Wissen und kein Fehler: wofür es ist, zu welchem Gerät oder "
+    "welcher Person es gehört, handschriftliche Beschriftungen auf Tüten. Das bleibt im Namen.\n"
+    "- Bist du unsicher, ist passt=true. Lieber nichts vorschlagen als etwas Falsches.\n"
+    "Bei passt=true name, beschreibung und grund leer lassen.")
+_namen_stand = {"laeuft": False, "fertig": 0, "gesamt": 0, "fehler": ""}
+_namen_sperre = threading.Lock()
+
+
+def _namen_ungeprueft() -> list:
+    """Sachen, deren jetziger Name noch nie geprüft wurde (oder seitdem geändert ist)."""
+    return V.execute("""SELECT s.* FROM sachen s LEFT JOIN namenspruefung n ON n.sache_id = s.id
+                        WHERE n.sache_id IS NULL OR n.alt <> s.name ORDER BY s.id""").fetchall()
+
+
+def _name_pruefen(s, en: bool = False) -> None:
+    pfade = [p for p in (_fotopfad(f) for f in _fotoliste(s)[:2]) if os.path.exists(p)]
+    text = (f"Bisheriger Eintrag:\nName: {s['name']}\nBeschreibung: {s['beschreibung']}\nArt: {s['bereich']}\n"
+            f"Menge: {s['menge']}\nNotiz: {s['notiz'] or ''}")
+    anweisung = NAMEN_ANWEISUNG + ("\nThe inventory is kept in English: write name, beschreibung and grund in English."
+                                   if en else "")
+    antwort, n = erkennung.frage_json(anweisung, text, NAMEN_SCHEMA, "namen", zeit=90, bildpfade=pfade)
+    _ki_nutzung(n)
+    name = _sauber(antwort.get("name"))[:120]
+    passt = bool(antwort.get("passt")) or not name or name == s["name"]
+    sicherheit = str(antwort.get("sicherheit") or "").lower()
+    V.execute("""INSERT INTO namenspruefung (sache_id, alt, name, beschreibung, grund, sicherheit, stand, am)
+                 VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(sache_id) DO UPDATE SET alt=excluded.alt, name=excluded.name,
+                 beschreibung=excluded.beschreibung, grund=excluded.grund, sicherheit=excluded.sicherheit,
+                 stand=excluded.stand, am=excluded.am""",
+              (s["id"], s["name"], "" if passt else name, "" if passt else _sauber(antwort.get("beschreibung"))[:500],
+               "" if passt else _sauber(antwort.get("grund"))[:200],
+               sicherheit if sicherheit in ("hoch", "mittel", "niedrig") else "mittel",
+               "passt" if passt else "offen", db.jetzt_iso()))
+    V.commit()
+
+
+def namen_pruefen(faeden: int = 2, en: bool = False) -> None:
+    """Prüft alle ungeprüften Sachen, zwei zugleich (der Claude-Dienst nimmt zwei an). Ein einzelner Fehlschlag
+    überspringt die Sache (sie bleibt ungeprüft); drei hintereinander beenden den Lauf."""
+    from concurrent.futures import ThreadPoolExecutor
+    zeilen = _namen_ungeprueft()
+    _namen_stand["gesamt"] = len(zeilen)
+    fehlschlaege = [0]
+
+    def eine(s):
+        if fehlschlaege[0] >= 3:
+            return
+        try:
+            _name_pruefen(s, en)
+            fehlschlaege[0] = 0
+        except erkennung.ErkennungsFehler as f:
+            _nutzung_merken(None, f.versuche, fehler_modell=erkennung.modell() if erkennung.schluessel() else "")
+            fehlschlaege[0] += 1
+            _namen_stand["fehler"] = f.meldung
+        except Exception as f:
+            fehlschlaege[0] += 1
+            _namen_stand["fehler"] = f"{type(f).__name__}: {f}"[:200]
+        finally:
+            _namen_stand["fertig"] += 1
+
+    try:
+        with ThreadPoolExecutor(faeden) as pool:
+            list(pool.map(eine, zeilen))
+        if fehlschlaege[0] < 3 and not _namen_ungeprueft():
+            _namen_stand["fehler"] = ""
+    finally:
+        _namen_stand["laeuft"] = False
+
+
+def _namen_vorschlag_json(z, kisten) -> dict:
+    s = _sache(z["sache_id"])
+    return {"sache": _sache_json(s, kisten.get(s["kiste_id"])), "alt": z["alt"], "name": z["name"],
+            "beschreibung": z["beschreibung"], "grund": z["grund"], "sicherheit": z["sicherheit"]}
+
+
+@app.post("/api/namen/pruefen")
+def namen_pruefen_starten(request: Request, x_token: str = Header(None)):
+    angemeldet(x_token)
+    if erkennung.demo():
+        raise HTTPException(503, "Auf dem Demo-Server gibt es diese KI-Hilfe nicht.")
+    if not erkennung.eingerichtet():
+        raise HTTPException(503, "Die KI ist nicht eingerichtet.")
+    with _namen_sperre:
+        if not _namen_stand["laeuft"]:
+            _namen_stand.update(laeuft=True, fertig=0, gesamt=0, fehler="")
+            threading.Thread(target=namen_pruefen, kwargs={"en": _en(request)}, name="namen", daemon=True).start()
+    return namen_stand_lesen(x_token)
+
+
+@app.get("/api/namen/stand")
+def namen_stand_lesen(x_token: str = Header(None)):
+    """Fortschritt, wie viele noch ungeprüft sind, und die offenen Vorschläge (unsichere zuletzt)."""
+    angemeldet(x_token)
+    kisten = {z["id"]: z for z in V.execute("SELECT * FROM kisten").fetchall()}
+    offen = V.execute("""SELECT n.* FROM namenspruefung n JOIN sachen s ON s.id = n.sache_id
+                         WHERE n.stand = 'offen' AND n.alt = s.name
+                         ORDER BY CASE n.sicherheit WHEN 'hoch' THEN 0 WHEN 'mittel' THEN 1 ELSE 2 END, n.sache_id""").fetchall()
+    return {**_namen_stand, "ungeprueft": len(_namen_ungeprueft()),
+            "geprueft": V.execute("SELECT COUNT(*) n FROM namenspruefung n JOIN sachen s ON s.id = n.sache_id "
+                                  "AND n.alt = s.name").fetchone()["n"],
+            "offen": [_namen_vorschlag_json(z, kisten) for z in offen]}
+
+
+def _namen_zeile(sid: int):
+    z = V.execute("SELECT * FROM namenspruefung WHERE sache_id=? AND stand='offen'", (sid,)).fetchone()
+    if not z:
+        raise HTTPException(404, "Diesen Vorschlag gibt es nicht (mehr)")
+    if z["alt"] != _sache(sid)["name"]:
+        raise HTTPException(409, "Der Name wurde inzwischen geändert -- der Vorschlag passt nicht mehr")
+    return z
+
+
+@app.post("/api/namen/{sid}/uebernehmen")
+def namen_uebernehmen(sid: int, x_token: str = Header(None)):
+    """Name (und Beschreibung, wenn vorgeschlagen) übernehmen. Danach gilt der neue Name als geprüft."""
+    angemeldet(x_token)
+    z = _namen_zeile(sid)
+    f = _felder({"name": z["name"], **({"beschreibung": z["beschreibung"]} if z["beschreibung"] else {})}, pflicht=False)
+    f["geaendert_am"] = db.jetzt_iso()
+    V.execute(f"UPDATE sachen SET {', '.join(k + '=?' for k in f)} WHERE id=?", (*f.values(), sid))
+    V.execute("UPDATE namenspruefung SET stand='uebernommen', alt=? WHERE sache_id=?", (f["name"], sid))
+    V.commit()
+    return _sache_json(_sache(sid))
+
+
+@app.post("/api/namen/{sid}/behalten")
+def namen_behalten(sid: int, x_token: str = Header(None)):
+    """Der alte Name bleibt; die Sache gilt als geprüft, solange niemand den Namen ändert."""
+    angemeldet(x_token)
+    _namen_zeile(sid)
+    V.execute("UPDATE namenspruefung SET stand='behalten' WHERE sache_id=?", (sid,))
+    V.commit()
+    return {"ok": True}
+
+
 # ---------------------------------------------------------------- Bauen
 
 BAUEN_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["titel", "teile", "fehlt", "hinweis"],
@@ -1930,7 +2114,8 @@ BAUEN_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["t
 def _bauen_demo(idee: str, zeilen: list, en: bool) -> tuple[dict, dict]:
     """Demo-Server (Googles Prüfer, 04.11.2026): keine KI, sondern eine Beispiel-Stückliste aus dem Bestand -- Sachen,
     deren Name, Beschreibung oder Suchwörter einen Wortanfang der Idee enthalten, sonst drei aus der Elektrik. So ist der Ablauf bis „Als Projekt merken" zu sehen."""
-    staemme = {w[:5] for w in re.findall(r"\w{3,}", idee.lower())}
+    fuell = {"with", "and", "for", "the", "from", "mit", "und", "für", "fuer", "der", "die", "das", "ein", "eine", "aus", "von"}
+    staemme = {w[:5] for w in re.findall(r"\w{3,}", idee.lower()) if w not in fuell}
     def text(z):
         return " ".join([z["name"], z["beschreibung"] or "", z["woerter"] or ""]).lower()
     passend = [z for z in zeilen if any(st in text(z) for st in staemme)][:4] or \

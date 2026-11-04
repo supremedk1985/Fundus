@@ -252,3 +252,69 @@ def test_bauen_demo_ohne_ki(client, monkeypatch):
     v = client.post("/api/bauen", json={"idee": "Shelf lighting with LED"}, headers={"Accept-Language": "en"}).json()
     assert [t["sache"]["id"] for t in v["teile"]] == [led["id"]] and v["titel"].endswith("(demo)") and v["modell"] == "demo"
     assert v["fehlt"] and "Demo server" in v["hinweis"]
+
+
+# ---------------------------------------------------------------- 04.11.: Wortreihenfolge, unsichtbare Zeichen, Namen prüfen
+
+def test_doppelt_auch_bei_anderer_wortreihenfolge_aber_nicht_bei_anderen_zahlen(client):
+    k1, k2 = kiste(client), kiste(client)
+    a = sache(client, k1["code"], "Solarkabel 4 mm², 3 m mit MC4-Steckern")
+    b = sache(client, k2["code"], "Solarkabel mit MC4-Steckern 4mm² 3m")
+    sache(client, k1["code"], "Lenkrolle mit Bremse 50 mm")
+    sache(client, k2["code"], "Lenkrolle mit Bremse 75 mm")
+    gruppen = [[s["id"] for s in g["sachen"]] for g in client.get("/api/aufraeumen").json()["doppelt"]]
+    assert gruppen == [[a["id"], b["id"]]]
+
+
+def test_weiche_trennstriche_fliegen_raus(client):
+    k = kiste(client)
+    s = sache(client, k["code"], "Perlator Wasser­spar­strah­ler M18,5", beschreibung="a​b", woerter=["spar­strahl"])
+    assert s["name"] == "Perlator Wassersparstrahler M18,5" and s["beschreibung"] == "ab" and s["woerter"] == ["sparstrahl"]
+
+
+def test_namen_pruefen_vorschlagen_uebernehmen_behalten(client, monkeypatch):
+    import app, erkennung
+    k = kiste(client)
+    f = foto(client)
+    falsch = sache(client, k["code"], "SH3X Infrarot Temperatursensor", fotos=[f])
+    richtig = sache(client, k["code"], "RFID-Modul RC522")
+    noch = sache(client, k["code"], "DollaTek Mikrocontroller Modul 5V Max 25V")
+    gesehen = {}
+
+    def fake(system, text, schema, name, **kw):
+        assert name == "namen" and "Bisheriger Eintrag" in text
+        gesehen[text.split("\n")[1]] = kw.get("bildpfade")
+        if "SH3X" in text:
+            return {"passt": False, "name": "SHT3x Temperatur- und Feuchtesensor", "beschreibung": "I²C-Sensor",
+                    "grund": "SHT3x misst Temperatur und Feuchte, nicht Infrarot", "sicherheit": "hoch"}, \
+                   {"modell": "claude-sonnet", "tokens_ein": 1, "tokens_aus": 1, "versuche": []}
+        if "DollaTek" in text:
+            return {"passt": False, "name": "Spannungssensor 0–25 V", "beschreibung": "", "grund": "Spannungsteiler",
+                    "sicherheit": "mittel"}, {"modell": "claude-sonnet", "tokens_ein": 1, "tokens_aus": 1, "versuche": []}
+        return {"passt": True, "name": "", "beschreibung": "", "grund": "", "sicherheit": "hoch"}, \
+               {"modell": "claude-sonnet", "tokens_ein": 1, "tokens_aus": 1, "versuche": []}
+    monkeypatch.setattr(erkennung, "frage_json", fake)
+    monkeypatch.setattr(erkennung, "eingerichtet", lambda: True)
+    app._namen_stand.update(laeuft=True, fertig=0, gesamt=0, fehler="")
+    app.namen_pruefen(faeden=1)
+    assert len(gesehen["Name: SH3X Infrarot Temperatursensor"]) == 1 and gesehen["Name: RFID-Modul RC522"] == []
+    st = client.get("/api/namen/stand").json()
+    assert st["ungeprueft"] == 0 and st["geprueft"] == 3 and not st["laeuft"] and st["fertig"] == 3
+    auf = client.get("/api/aufraeumen").json()
+    assert auf["namen_offen"] == 2 and auf["namen_ungeprueft"] == 0 and auf["namen_laeuft"] is False
+    assert [(v["sache"]["id"], v["name"]) for v in st["offen"]] == [
+        (falsch["id"], "SHT3x Temperatur- und Feuchtesensor"), (noch["id"], "Spannungssensor 0–25 V")]
+    neu = client.post(f"/api/namen/{falsch['id']}/uebernehmen").json()
+    assert neu["name"] == "SHT3x Temperatur- und Feuchtesensor" and neu["beschreibung"] == "I²C-Sensor"
+    assert client.post(f"/api/namen/{noch['id']}/behalten").json() == {"ok": True}
+    assert client.post(f"/api/namen/{richtig['id']}/uebernehmen").status_code == 404
+    st = client.get("/api/namen/stand").json()
+    assert st["offen"] == [] and st["ungeprueft"] == 0
+    # wer den Namen selbst ändert, macht die Sache wieder ungeprüft
+    client.patch(f"/api/sachen/{richtig['id']}", json={"name": "RFID-Lesemodul RC522"})
+    assert client.get("/api/namen/stand").json()["ungeprueft"] == 1
+
+
+def test_namen_pruefen_nicht_im_demo(client, monkeypatch):
+    monkeypatch.setenv("DEMO", "1")
+    assert client.post("/api/namen/pruefen").status_code == 503
