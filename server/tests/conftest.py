@@ -18,6 +18,8 @@ def client(monkeypatch):
     monkeypatch.setattr(db, "FOTOS", os.path.join(tmp, "fotos"))
     monkeypatch.setenv("PASSWORT", "geheim123")
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("CLAUDE_KI_URL", raising=False)       # nie das echte Claude (03.11.2026)
+    monkeypatch.delenv("CLAUDE_KI_SCHLUESSEL", raising=False)
     monkeypatch.delenv("DEMO", raising=False)
     from fastapi.testclient import TestClient
     import app as servermodul

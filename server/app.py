@@ -667,6 +667,10 @@ def foto_vorschlag(fid: str, daten: dict, x_token: str = Header(None)):
     helligkeit, kontrast, schaerfe, pinsel [{art: dazu|weg, breite, punkte: [[x,y], …]}] (Anteile des Originals).
     `wie_zuletzt: true` nimmt die Einstellungen der letzten Übernahme dieses Fotos als Ausgang."""
     angemeldet(x_token)
+    return _vorschlag_rechnen(fid, daten)
+
+
+def _vorschlag_rechnen(fid: str, daten: dict) -> dict:
     original = _original_von(fid)
     pfad = _fotopfad(original)
     if not os.path.exists(pfad):
@@ -711,16 +715,20 @@ def vorschlag_uebernehmen(vid: str, daten: dict, x_token: str = Header(None)):
     Eine frühere Aufbereitung desselben Originals wird ersetzt, nicht verdoppelt."""
     angemeldet(x_token)
     try:
+        sid = int(daten.get("sache_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(422, "sache_id fehlt")
+    return _vorschlag_uebernehmen(vid, sid)
+
+
+def _vorschlag_uebernehmen(vid: str, sid: int) -> dict:
+    try:
         with open(_vorschlagspfad(vid, ".json")) as f:
             meta = json.load(f)
         with open(_vorschlagspfad(vid), "rb") as f:
             inhalt = f.read()
     except OSError:
         raise HTTPException(404, "Diesen Vorschlag gibt es nicht mehr -- bitte neu rechnen")
-    try:
-        sid = int(daten.get("sache_id"))
-    except (TypeError, ValueError):
-        raise HTTPException(422, "sache_id fehlt")
     s = _sache(sid)
     original = meta["original"]
     liste = _fotoliste(s)
@@ -802,6 +810,19 @@ def aufbereitung_stand(umfang: str = "offen", x_token: str = Header(None)):
 
 # ---------------------------------------------------------------- Erkennung
 
+def _nutzung_merken(nutzung: dict | None, versuche: list[dict], fehler_modell: str = ""):
+    """Jede Anfrage eine Zeile: gescheiterte Claude-Versuche (ok=0, Grund im Modellfeld nach „ · "), dann der Erfolg
+    oder -- wenn auch OpenAI scheiterte -- dessen Fehlschlag."""
+    for v in versuche:
+        V.execute("INSERT INTO nutzung (wann, modell, ok) VALUES (?,?,0)", (db.jetzt_iso(), f"{v['modell']} · {v['grund']}"[:200]))
+    if nutzung:
+        V.execute("INSERT INTO nutzung (wann, modell, tokens_ein, tokens_aus, ok) VALUES (?,?,?,?,1)",
+                  (db.jetzt_iso(), nutzung["modell"], nutzung["tokens_ein"], nutzung["tokens_aus"]))
+    elif fehler_modell or not versuche:
+        V.execute("INSERT INTO nutzung (wann, modell, ok) VALUES (?,?,0)", (db.jetzt_iso(), fehler_modell or erkennung.modell()))
+    V.commit()
+
+
 @app.post("/api/erkennen")
 def erkennen(daten: dict, request: Request, x_token: str = Header(None)):
     angemeldet(x_token)
@@ -815,12 +836,9 @@ def erkennen(daten: dict, request: Request, x_token: str = Header(None)):
         vorschlag, nutzung = erkennung.erkennen(pfade, _bereiche(), str(daten.get("hinweis") or "")[:200],
                                                 en=_en(request))
     except erkennung.ErkennungsFehler as f:
-        V.execute("INSERT INTO nutzung (wann, modell, ok) VALUES (?,?,0)", (db.jetzt_iso(), erkennung.modell()))
-        V.commit()
+        _nutzung_merken(None, f.versuche, fehler_modell=erkennung.modell() if erkennung.schluessel() else "")
         raise HTTPException(f.status, f.meldung)
-    V.execute("INSERT INTO nutzung (wann, modell, tokens_ein, tokens_aus, ok) VALUES (?,?,?,?,1)",
-              (db.jetzt_iso(), nutzung["modell"], nutzung["tokens_ein"], nutzung["tokens_aus"]))
-    V.commit()
+    _nutzung_merken(nutzung, nutzung.get("versuche") or [])
     anfrage = " ".join([vorschlag.get("name", "")] + vorschlag.get("woerter", [])[:3])
     aehnliche = [s for p, s in _suchen(anfrage) if p >= 6][:3] if anfrage.strip() else []
     return {"vorschlag": vorschlag, "aehnliche": aehnliche, "gleiche": _gleiche([vorschlag.get("name", "")])}
@@ -866,10 +884,9 @@ def aus_link(daten: dict, request: Request, x_token: str = Header(None)):
         try:
             vorschlag, n = erkennung.erkennen([_fotopfad(fid)] if fid else [], _bereiche(),
                                               produkttext=produktlink.als_text(produkt), en=_en(request))
-            V.execute("INSERT INTO nutzung (wann, modell, tokens_ein, tokens_aus, ok) VALUES (?,?,?,?,1)",
-                      (db.jetzt_iso(), n["modell"], n["tokens_ein"], n["tokens_aus"]))
-            V.commit()
+            _nutzung_merken(n, n.get("versuche") or [])
         except erkennung.ErkennungsFehler as f:
+            _nutzung_merken(None, f.versuche, fehler_modell=erkennung.modell() if erkennung.schluessel() else "")
             hinweis = f.meldung
     else:
         hinweis = "Die Bilderkennung ist nicht eingerichtet; übernommen ist nur der Titel."
@@ -890,8 +907,16 @@ def nutzung(x_token: str = Header(None)):
     monat = datetime.now(timezone.utc).strftime("%Y-%m")
     z = V.execute("SELECT COUNT(*) n, COALESCE(SUM(ok),0) ok, COALESCE(SUM(tokens_ein),0) ein, "
                   "COALESCE(SUM(tokens_aus),0) aus FROM nutzung WHERE wann LIKE ?", (monat + "%",)).fetchone()
+    je = V.execute("SELECT CASE WHEN instr(modell, ' · ') > 0 THEN substr(modell, 1, instr(modell, ' · ') - 1) "
+                   "ELSE modell END m, COUNT(*) n, COALESCE(SUM(ok),0) ok FROM nutzung WHERE wann LIKE ? GROUP BY m "
+                   "ORDER BY n DESC", (monat + "%",)).fetchall()
+    rueckfaelle = V.execute("SELECT wann, modell FROM nutzung WHERE wann LIKE ? AND ok=0 AND modell LIKE 'claude-%' "
+                            "ORDER BY wann DESC LIMIT 5", (monat + "%",)).fetchall()
     return {"monat": monat, "anfragen": z["n"], "erfolgreich": z["ok"], "tokens_ein": z["ein"],
-            "tokens_aus": z["aus"], "eingerichtet": erkennung.eingerichtet(), "modell": erkennung.modell()}
+            "tokens_aus": z["aus"], "eingerichtet": erkennung.eingerichtet(), "modell": erkennung.modell(),
+            "claude": erkennung.claude_eingerichtet(), "claude_modell": erkennung.claude_modell(),
+            "je_modell": [{"modell": r["m"], "anfragen": r["n"], "erfolgreich": r["ok"]} for r in je],
+            "rueckfaelle": [{"wann": r["wann"], "grund": r["modell"].split(" · ", 1)[-1]} for r in rueckfaelle]}
 
 
 # ---------------------------------------------------------------- Bilderkennung einstellen (01.11.2026)
@@ -902,7 +927,8 @@ def _ki_stand() -> dict:
     s = erkennung.schluessel()
     return {"eingerichtet": erkennung.eingerichtet(), "quelle": erkennung.quelle(), "demo": erkennung.demo(),
             "ende": s[-4:] if len(s) > 8 else "", "modell": erkennung.modell(),
-            "vorgabe_modell": erkennung.VORGABE_MODELL}
+            "vorgabe_modell": erkennung.VORGABE_MODELL,
+            "claude": erkennung.claude_eingerichtet(), "claude_modell": erkennung.claude_modell()}
 
 
 @app.get("/api/einstellungen/ki")
@@ -969,6 +995,13 @@ def _fotoliste(s) -> list[str]:
     return liste
 
 
+def _merkmale_lesen(s) -> list[dict]:
+    try:
+        return json.loads(s["merkmale"] or "[]")
+    except (ValueError, IndexError, KeyError):
+        return []
+
+
 def _sache_json(s, kiste=None) -> dict:
     if kiste is None:
         kiste = V.execute("SELECT * FROM kisten WHERE id=?", (s["kiste_id"],)).fetchone()
@@ -982,6 +1015,7 @@ def _sache_json(s, kiste=None) -> dict:
             "leer": _leer(s["menge"]),
             "link": s["link"], "raus_anzahl": s["raus_anzahl"], "fotos": _fotoliste(s), "notiz": s["notiz"],
             "angelegt_am": s["angelegt_am"], "geaendert_am": s["geaendert_am"],
+            "merkmale": _merkmale_lesen(s),
             "kiste": _kiste_json(kiste) if kiste else None,
             # Bilder optimieren: aufbereitetes Foto -> sein Original, damit die App „Original" dranschreiben kann
             "aufbereitet": {z["neu"]: z["original"] for z in V.execute(
@@ -1001,6 +1035,8 @@ def _felder(daten: dict, pflicht: bool) -> dict:
             f[feld] = str(daten.get(feld) or "").strip()[:laenge]
     if "bereich" in f:
         f["bereich"] = bereich_glaetten(f["bereich"])
+    if "merkmale" in daten:
+        f["merkmale"] = json.dumps(erkennung.merkmale_glaetten(daten.get("merkmale")), ensure_ascii=False)
     if "woerter" in daten or pflicht:
         ws = daten.get("woerter") or []
         if not isinstance(ws, list):
@@ -1046,14 +1082,18 @@ def sache_anlegen(daten: dict, x_token: str = Header(None)):
     f = _felder(daten, pflicht=True)
     jetzt = db.jetzt_iso()
     cur = V.execute("INSERT INTO sachen (kiste_id, name, beschreibung, bereich, menge, woerter, link, notiz, angelegt_am, "
-                    "geaendert_am) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    "geaendert_am, merkmale) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     (kiste["id"], f["name"], f["beschreibung"], f["bereich"], f["menge"], f["woerter"], f["link"],
-                     f["notiz"], jetzt, jetzt))
+                     f["notiz"], jetzt, jetzt, f.get("merkmale")))
     if "fotos" in daten:
         _fotos_setzen(cur.lastrowid, daten["fotos"])
     elif daten.get("foto"):
         _fotos_setzen(cur.lastrowid, [daten["foto"]])
     V.commit()
+    # Einräumen am Fließband (03.11.2026): Zuschnitt und Farbe macht der Server danach von selbst -- Freistellen
+    # NICHT (Daniel: „Das Freistellen darf nicht dazugehören"; 38-mal abgeschaltet, 9-mal nachgebessert).
+    if daten.get("aufbereiten") and (_fotoliste(V.execute("SELECT * FROM sachen WHERE id=?", (cur.lastrowid,)).fetchone())):
+        nach_dem_anlegen_aufbereiten(cur.lastrowid)
     return _sache_json(V.execute("SELECT * FROM sachen WHERE id=?", (cur.lastrowid,)).fetchone())
 
 
@@ -1148,13 +1188,18 @@ def _gleiche(namen: list[str], link: str = "") -> list[dict]:
     """GENAU dieselbe Sache, nicht bloß ähnlich (Daniel, 02.10.): gleicher Shop-Link oder gleicher Name
     (Groß-/Kleinschreibung, Umlaute, Satzzeichen egal). Für das Auswahlfenster „zu den anderen oder neu?"."""
     ziele = {suche.normalisieren(n) for n in namen if n and suche.normalisieren(n)}
+    # Seit 03.11.2026 auch dieselbe Typbezeichnung (RC522, FS1000A): Claude nannte ein RC522 „RFID-Modul RC522
+    # (MFRC522, 13,56 MHz)" -- am Namen allein hätte das Einräumen das vorhandene in K-06 nicht gefunden.
+    typen = set().union(*(_typen(n) for n in namen if n)) if namen else set()
     lk = _linkschluessel(link)
     kisten = {z["id"]: z for z in V.execute("SELECT * FROM kisten").fetchall()}
-    treffer = []
+    genau, gleicher_typ = [], []
     for z in V.execute("SELECT * FROM sachen ORDER BY angelegt_am DESC").fetchall():
         if suche.normalisieren(z["name"]) in ziele or (lk and _linkschluessel(z["link"] or "") == lk):
-            treffer.append(_sache_json(z, kisten.get(z["kiste_id"])))
-    return treffer[:5]
+            genau.append(_sache_json(z, kisten.get(z["kiste_id"])))
+        elif typen and not _leer(z["menge"]) and typen & _typen(z["name"]):
+            gleicher_typ.append(_sache_json(z, kisten.get(z["kiste_id"])))
+    return (genau + gleicher_typ)[:5]
 
 
 @app.get("/api/suche")
@@ -1187,6 +1232,8 @@ def uebersicht(x_token: str = Header(None)):
             "zuletzt": [_sache_json(s) for s in zuletzt],
             "raus": [_sache_json(s) for s in raus],
             "bereiche": _bereiche(),
+            # Für „Stöbern nach Art" auf der Startseite (03.11.2026): Sachen je Bereich, ohne Aufgebrauchtes
+            "bereiche_anzahl": _bereiche_anzahl(),
             "erkennung": erkennung.eingerichtet()}
 
 
@@ -1518,3 +1565,449 @@ def gesundheit():
     n = V.execute("SELECT COUNT(*) n FROM sachen").fetchone()["n"]
     # „dienst" lässt die App beim Eintragen der Adresse erkennen, dass dort wirklich ein Fundus-Server antwortet.
     return {"ok": True, "dienst": "fundus", "sachen": n, "erkennung": erkennung.eingerichtet(), "demo": erkennung.demo()}
+
+
+# ================================================================ Fundus 2 (03.11.2026)
+# Daniel: „Mach mal einen Entwurf für eine Überarbeitung von Fundus. Schau dir es tief an." → Entwurf mit Befund
+# (claude.ai/artifact/32b7X8oq8SzV79X9FXpccw), dann: „bau das und dann setze die Entwürfe um". Hier der Server-Teil:
+# Arten zählen, automatisch aufbereiten (ohne Freistellen), Aufräumliste mit „vielleicht doppelt", Zusammenlegen,
+# neue Einteilung (Arten) per KI, Steckbriefe nachtragen, Bauen. Alles nur Ergänzungen -- eine ältere App läuft weiter.
+
+import difflib, queue, threading
+
+
+def _bereiche_anzahl() -> list[dict]:
+    zahlen: dict[str, int] = {}
+    for z in V.execute("SELECT bereich, menge FROM sachen").fetchall():
+        if not _leer(z["menge"]):
+            b = z["bereich"] or ""
+            zahlen[b] = zahlen.get(b, 0) + 1
+    return [{"name": b, "anzahl": n} for b, n in sorted(zahlen.items(), key=lambda x: (-x[1], x[0].casefold()))]
+
+
+def _ki_nutzung(n: dict) -> None:
+    _nutzung_merken(n, n.get("versuche") or [])
+
+
+# ---------------------------------------------------------------- automatisch aufbereiten (ohne Freistellen)
+
+_aufbereit_schlange: "queue.Queue[int]" = queue.Queue()
+_aufbereit_faden: threading.Thread | None = None
+_aufbereit_sperre = threading.Lock()
+AUTO_EINSTELLUNGEN = {"zuschneiden": True, "verbessern": True, "freistellen": False}
+
+
+def nach_dem_anlegen_aufbereiten(sid: int) -> None:
+    global _aufbereit_faden
+    if not aufbereiten.ISNET.vorhanden():
+        return
+    _aufbereit_schlange.put(sid)
+    with _aufbereit_sperre:
+        if _aufbereit_faden is None or not _aufbereit_faden.is_alive():
+            _aufbereit_faden = threading.Thread(target=_aufbereit_arbeiter, name="aufbereiten", daemon=True)
+            _aufbereit_faden.start()
+
+
+def _aufbereit_arbeiter() -> None:
+    while True:
+        try:
+            sid = _aufbereit_schlange.get(timeout=60)
+        except queue.Empty:
+            return
+        try:
+            s = V.execute("SELECT * FROM sachen WHERE id=?", (sid,)).fetchone()
+            liste = _fotoliste(s) if s else []
+            if liste and not V.execute("SELECT 1 FROM aufbereitung WHERE original=? OR neu=?", (liste[0], liste[0])).fetchone():
+                v = _vorschlag_rechnen(liste[0], dict(AUTO_EINSTELLUNGEN))
+                _vorschlag_uebernehmen(v["id"], sid)
+        except Exception as f:          # ein Bild, das nicht klappt, darf die Schlange nicht anhalten
+            print(f"aufbereiten {sid}: {type(f).__name__}: {f}", flush=True)
+        finally:
+            _aufbereit_schlange.task_done()
+
+
+# ---------------------------------------------------------------- Aufräumliste
+
+# Ohne Leerzeichen zwischen Buchstaben und Ziffern: „Klemme 221-413" ist keine Typbezeichnung „KLEMME221" (fasste sonst
+# 221-412 und 221-413 als gleich zusammen); „HC-SR501", „FS1000A", „DS18B20" schon.
+_TYP = re.compile(r"(?<![A-Za-z0-9])([A-Za-z]{2,6}-?\d{2,5}[A-Za-z]{0,3}\d{0,3})(?![A-Za-z0-9])")
+# Familien statt Typen: zwei Sachen mit „ESP32" sind selten dieselbe (Dev Kit, Audio-Kit, LoRa-Tracker)
+_FAMILIEN = {"ESP32", "ESP8266", "ESP01", "STM32", "RP2040", "ATMEGA328", "USB2", "USB3", "CAT5", "CAT6", "IP65",
+             "IP67", "IP44", "IP20", "IP30"}
+
+
+def _typen(name: str) -> set[str]:
+    return {t.upper().replace("-", "").replace(" ", "") for t in _TYP.findall(name or "")} - _FAMILIEN
+
+
+def vielleicht_doppelt(sachen: list[dict], verworfen: dict[str, str]) -> list[dict]:
+    """Gruppen, die wohl dieselbe Sache mehrfach erfasst sind (Befund 03.11.: dreimal FS1000A in K-06).
+    Gleich heißt: gleicher Name (normalisiert) -- oder gleiche Typbezeichnung UND (gleiche Kiste oder sehr
+    ähnlicher Name). Aufgebrauchte zählen nicht mit. `verworfen`: schluessel → ids aus „Sind verschieden"."""
+    lebend = [s for s in sachen if not _leer(s["menge"])]
+    gruppen: dict[str, dict] = {}
+    for s in lebend:
+        for t in _typen(s["name"]):
+            gruppen.setdefault("typ:" + t, {"grund": t, "ids": []})["ids"].append(s["id"])
+        n = suche.normalisieren(s["name"])
+        if n:
+            gruppen.setdefault("name:" + n, {"grund": s["name"], "ids": []})["ids"].append(s["id"])
+    nach_id = {s["id"]: s for s in lebend}
+    fertig, belegt = [], set()
+    for schluessel, g in sorted(gruppen.items(), key=lambda kv: (kv[0].startswith("typ:"), kv[0])):
+        ids = sorted(set(g["ids"]))
+        if len(ids) < 2:
+            continue
+        if schluessel.startswith("typ:"):
+            # nur, wer mit einem anderen in derselben Kiste liegt oder fast gleich heißt
+            def nah(a, b):
+                return a["kiste_id"] == b["kiste_id"] or difflib.SequenceMatcher(
+                    None, suche.normalisieren(a["name"]), suche.normalisieren(b["name"])).ratio() >= 0.8
+            ids = [i for i in ids if any(nah(nach_id[i], nach_id[j]) for j in ids if j != i)]
+            if len(ids) < 2:
+                continue
+        if tuple(ids) in belegt or verworfen.get(schluessel) == ",".join(map(str, ids)):
+            continue
+        belegt.add(tuple(ids))
+        fertig.append({"schluessel": schluessel, "grund": g["grund"], "ids": ids})
+    return fertig
+
+
+@app.get("/api/aufraeumen")
+def aufraeumen(x_token: str = Header(None)):
+    """Was gerade unordentlich ist: vielleicht doppelt, Kisten ohne Platz oder ohne Art, draußen, aufgebraucht,
+    und ob eine neue Einteilung sich lohnt (ein Bereich mit mehr als der Hälfte der Sachen)."""
+    angemeldet(x_token)
+    kisten = {z["id"]: z for z in V.execute("SELECT * FROM kisten").fetchall()}
+    zeilen = V.execute("SELECT * FROM sachen").fetchall()
+    verworfen = {z["schluessel"]: z["ids"] for z in V.execute("SELECT * FROM nicht_doppelt").fetchall()}
+    nach_id = {z["id"]: z for z in zeilen}
+    doppelt = [{"schluessel": g["schluessel"], "grund": g["grund"],
+                "sachen": [_sache_json(nach_id[i], kisten.get(nach_id[i]["kiste_id"])) for i in g["ids"]]}
+               for g in vielleicht_doppelt([dict(z) for z in zeilen], verworfen)]
+    anzahl = _anzahl_je_kiste()
+    ohne_platz = [_kiste_json(k, anzahl.get(k["id"], 0)) for k in sorted(kisten.values(), key=lambda k: k["code"])
+                  if not k["stapel"] and not k["regal_id"]]
+    ohne_art = [k["code"] for k in sorted(kisten.values(), key=lambda k: k["code"]) if not (k["art"] or "").strip()]
+    raus = [_sache_json(s, kisten.get(s["kiste_id"])) for s in zeilen if s["raus_seit"]]
+    leer = [_sache_json(s, kisten.get(s["kiste_id"])) for s in _leere_sachen()]
+    ba = _bereiche_anzahl()
+    gesamt = sum(b["anzahl"] for b in ba) or 1
+    groesster = ba[0] if ba else {"name": "", "anzahl": 0}
+    ohne_merkmale = V.execute("SELECT COUNT(*) n FROM sachen WHERE merkmale IS NULL").fetchone()["n"]
+    return {"doppelt": doppelt, "ohne_platz": ohne_platz, "ohne_art": ohne_art, "raus": raus, "leer": leer,
+            "arten": {"groesster": groesster["name"], "anteil": round(groesster["anzahl"] / gesamt, 2),
+                      "lohnt": groesster["anzahl"] / gesamt > 0.5 and gesamt >= 20},
+            "ohne_merkmale": ohne_merkmale, "merkmale_laeuft": _merkmale_stand["laeuft"]}
+
+
+@app.post("/api/doppelt/verschieden")
+def doppelt_verschieden(daten: dict, x_token: str = Header(None)):
+    angemeldet(x_token)
+    schluessel = str(daten.get("schluessel") or "").strip()[:200]
+    ids = sorted({int(i) for i in (daten.get("ids") or [])})
+    if not schluessel or len(ids) < 2:
+        raise HTTPException(422, "Es fehlen Gruppe oder Sachen")
+    V.execute("INSERT INTO nicht_doppelt (schluessel, ids, am) VALUES (?,?,?) ON CONFLICT(schluessel) DO UPDATE SET "
+              "ids=excluded.ids, am=excluded.am", (schluessel, ",".join(map(str, ids)), db.jetzt_iso()))
+    V.commit()
+    return {"ok": True}
+
+
+def menge_zusammen(mengen: list[str]) -> str:
+    """„3" + „ca. 3" + „1 Stück" → „7 Stück": die ersten Zahlen addieren, die Einheit der ersten mit Einheit.
+    Ohne Zahl zählt eine Sache als 1."""
+    summe, einheit = 0, ""
+    for m in mengen:
+        z = _ERSTE_ZAHL.search(m or "")
+        summe += int(z.group()) if z else 1
+        rest = re.sub(r"(?i)\bca\.?\s*", "", (m or "")[z.end():] if z else (m or "")).strip()
+        if not einheit and rest:
+            einheit = rest
+    return f"{summe} {einheit}".strip()
+
+
+@app.post("/api/sachen/zusammenlegen")
+def zusammenlegen(daten: dict, x_token: str = Header(None)):
+    """{ziel, quellen: [...]} → aus mehreren Einträgen wird einer: Mengen addiert, Fotos (bis 8), Suchwörter und
+    Steckbrief vereinigt, Notizen angehängt. Stücklisten zeigen danach auf das Ziel. Die Quellen sind weg."""
+    angemeldet(x_token)
+    try:
+        ziel = int(daten.get("ziel"))
+        quellen = [int(q) for q in (daten.get("quellen") or []) if int(q) != ziel]
+    except (TypeError, ValueError):
+        raise HTTPException(422, "ziel und quellen müssen Zahlen sein")
+    if not quellen:
+        raise HTTPException(422, "Es fehlen Gruppe oder Sachen")
+    z = _sache(ziel)
+    q = [_sache(i) for i in quellen]
+    alle = [z] + q
+    fotos = list(dict.fromkeys(f for s in alle for f in _fotoliste(s)))[:MAX_FOTOS]
+    woerter = sorted({w for s in alle for w in json.loads(s["woerter"] or "[]")})[:30]
+    merkmale = erkennung.merkmale_glaetten([m for s in alle for m in _merkmale_lesen(s)])
+    notiz = "\n".join(dict.fromkeys(s["notiz"].strip() for s in alle if (s["notiz"] or "").strip()))[:1000]
+    beschreibung = max((s["beschreibung"] or "" for s in alle), key=len)
+    V.execute("UPDATE sachen SET menge=?, woerter=?, merkmale=?, notiz=?, beschreibung=?, link=CASE WHEN link='' THEN ? ELSE link END, "
+              "geaendert_am=? WHERE id=?",
+              (menge_zusammen([s["menge"] for s in alle])[:40], json.dumps(woerter, ensure_ascii=False),
+               json.dumps(merkmale, ensure_ascii=False), notiz, beschreibung[:500],
+               next((s["link"] for s in q if s["link"]), ""), db.jetzt_iso(), ziel))
+    for s in q:
+        V.execute("UPDATE projekt_teile SET sache_id=? WHERE sache_id=?", (ziel, s["id"]))
+        V.execute("UPDATE aufbereitung SET sache_id=? WHERE sache_id=?", (ziel, s["id"]))
+        V.execute("UPDATE fotos SET sache_id=NULL WHERE sache_id=?", (s["id"],))
+        V.execute("DELETE FROM sachen WHERE id=?", (s["id"],))
+    _fotos_setzen(ziel, fotos)
+    V.commit()
+    return _sache_json(_sache(ziel))
+
+
+# ---------------------------------------------------------------- neue Einteilung (Arten)
+
+ARTEN_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["arten"], "properties": {
+    "arten": {"type": "array", "items": {"type": "object", "additionalProperties": False, "required": ["name", "ids"],
+                                         "properties": {"name": {"type": "string"},
+                                                        "ids": {"type": "array", "items": {"type": "integer"}}}}}}}
+
+
+def _sicherung(anlass: str) -> str:
+    """Kopie der Datenbank vor einer Massenänderung, nach data/sicherungen (sqlite-Backup, auch mit WAL richtig)."""
+    import sqlite3
+    ordner = os.path.join(db.DATEN, "sicherungen")
+    os.makedirs(ordner, exist_ok=True)
+    ziel = os.path.join(ordner, f"fundus-vor-{anlass}-{datetime.now():%Y%m%d-%H%M%S}.sqlite3")
+    with sqlite3.connect(ziel) as kopie:
+        V.v.backup(kopie)
+    return os.path.basename(ziel)
+
+
+@app.post("/api/arten/vorschlag")
+def arten_vorschlag(request: Request, x_token: str = Header(None)):
+    """Die KI ordnet alle Sachen in 8–14 Arten (Daniel bestätigt in der App, nichts wird hier geändert)."""
+    angemeldet(x_token)
+    zeilen = V.execute("SELECT id, name, bereich FROM sachen ORDER BY id").fetchall()
+    if not zeilen:
+        raise HTTPException(422, "Es gibt noch keine Sachen")
+    en = _en(request)
+    system = ("You sort the items of a private home workshop into 8 to 14 clear categories (in English). Many items are "
+              "electronics hobby parts -- split those finely (e.g. Microcontrollers, Sensors, Displays, Radio & network, "
+              "Power & batteries, Switches & relays, LEDs & lighting, Cables & connectors); everything else coarser "
+              "(Tools, Fixings, Household & garden, …). Every id exactly once.") if en else (
+              "Du teilst die Sachen einer privaten Heimwerker-Werkstatt in 8 bis 14 klare Arten ein (Deutsch, kurz, "
+              "z. B. „Funk & Netz“). Viele Sachen sind Elektronik-Bastelteile -- die fein aufteilen (z. B. "
+              "Mikrocontroller, Sensoren, Anzeigen, Funk & Netz, Strom & Akkus, Schalter & Relais, LEDs & Licht, "
+              "Kabel & Stecker); alles andere gröber (Werkzeug, Befestigung, Haushalt & Garten, …). Jede id genau einmal.")
+    text = "\n".join(f"{z['id']}|{z['name']}|{z['bereich']}" for z in zeilen)
+    try:
+        antwort, n = erkennung.frage_json(system, "id|name|bisheriger Bereich\n" + text, ARTEN_SCHEMA, "arten")
+    except erkennung.ErkennungsFehler as f:
+        _nutzung_merken(None, f.versuche, fehler_modell=erkennung.modell() if erkennung.schluessel() else "")
+        raise HTTPException(f.status, f.meldung)
+    _ki_nutzung(n)
+    alle = {z["id"]: z for z in zeilen}
+    gesehen: set[int] = set()
+    arten = []
+    for a in antwort.get("arten") or []:
+        name = bereich_glaetten(str(a.get("name") or ""))[:40]
+        ids = [int(i) for i in (a.get("ids") or []) if isinstance(i, (int, float, str)) and str(i).isdigit()
+               and int(i) in alle and int(i) not in gesehen]
+        gesehen.update(ids)
+        if name and ids:
+            arten.append({"name": name, "ids": ids, "beispiele": [alle[i]["name"] for i in ids[:3]]})
+    vergessen = [i for i in alle if i not in gesehen]
+    if vergessen:   # was die KI ausließ, behält seinen Bereich
+        for i in vergessen:
+            b = alle[i]["bereich"] or "Sonstiges"
+            ziel = next((a for a in arten if a["name"] == b), None)
+            if ziel is None:
+                ziel = {"name": b, "ids": [], "beispiele": []}
+                arten.append(ziel)
+            ziel["ids"].append(i)
+    arten.sort(key=lambda a: -len(a["ids"]))
+    return {"arten": arten, "modell": n["modell"]}
+
+
+@app.post("/api/arten/uebernehmen")
+def arten_uebernehmen(daten: dict, x_token: str = Header(None)):
+    """{arten: [{name, ids}]} → jeder Sache ihren neuen Bereich. Vorher eine Kopie der Datenbank."""
+    angemeldet(x_token)
+    arten = daten.get("arten") or []
+    zuordnung: dict[int, str] = {}
+    for a in arten:
+        name = " ".join(str(a.get("name") or "").split())[:40]
+        if not name:
+            raise HTTPException(422, "Eine Art braucht einen Namen")
+        for i in a.get("ids") or []:
+            zuordnung[int(i)] = name[:1].upper() + name[1:]
+    if not zuordnung:
+        raise HTTPException(422, "Es fehlen Gruppe oder Sachen")
+    sicherung = _sicherung("arten")
+    geaendert = 0
+    for i, name in zuordnung.items():
+        c = V.execute("UPDATE sachen SET bereich=?, geaendert_am=? WHERE id=? AND bereich<>?", (name, db.jetzt_iso(), i, name))
+        geaendert += c.rowcount
+    V.commit()
+    return {"geaendert": geaendert, "sicherung": sicherung, "bereiche_anzahl": _bereiche_anzahl()}
+
+
+# ---------------------------------------------------------------- Steckbriefe nachtragen
+
+MERKMALE_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["sachen"], "properties": {
+    "sachen": {"type": "array", "items": {"type": "object", "additionalProperties": False, "required": ["id", "merkmale"],
+                                          "properties": {"id": {"type": "integer"},
+                                                         "merkmale": erkennung.SCHEMA["properties"]["merkmale"]}}}}}
+_merkmale_stand = {"laeuft": False, "fertig": 0, "fehler": ""}
+_merkmale_sperre = threading.Lock()
+
+
+def merkmale_nachtragen(paket: int = 20, en: bool = False) -> None:
+    """Für alle Sachen ohne Steckbrief (merkmale NULL) in Paketen aus Name und Beschreibung -- ohne Foto, ohne
+    Erfinden. Ein Paket, das scheitert, beendet den Lauf (die übrigen bleiben NULL und kommen beim nächsten dran)."""
+    system = ("Für jede Sache: 0 bis 6 technische Eckdaten als name/wert, NUR aus Name und Beschreibung ablesbar "
+              "(Typ, Frequenz, Spannung, Strom, Leistung, Schnittstelle, Länge, Gewinde, Körnung, Inhalt …). "
+              "Nichts erfinden -- im Zweifel weglassen. Werte knapp (z. B. „433 MHz“).")
+    try:
+        while True:
+            zeilen = V.execute("SELECT id, name, beschreibung FROM sachen WHERE merkmale IS NULL ORDER BY id LIMIT ?",
+                               (paket,)).fetchall()
+            if not zeilen:
+                return
+            text = "\n".join(f"{z['id']}|{z['name']}|{z['beschreibung']}" for z in zeilen)
+            antwort, n = erkennung.frage_json(system, "id|name|beschreibung\n" + text, MERKMALE_SCHEMA, "merkmale")
+            _ki_nutzung(n)
+            gekommen = {}
+            for e in antwort.get("sachen") or []:
+                try:
+                    gekommen[int(e.get("id"))] = erkennung.merkmale_glaetten(e.get("merkmale"))
+                except (TypeError, ValueError):
+                    pass
+            for z in zeilen:   # auch ohne Antwort „gefragt" setzen, sonst kreist der Lauf um dieselbe Sache
+                V.execute("UPDATE sachen SET merkmale=? WHERE id=? AND merkmale IS NULL",
+                          (json.dumps(gekommen.get(z["id"], []), ensure_ascii=False), z["id"]))
+            V.commit()
+            _merkmale_stand["fertig"] += len(zeilen)
+    except erkennung.ErkennungsFehler as f:
+        _nutzung_merken(None, f.versuche, fehler_modell=erkennung.modell() if erkennung.schluessel() else "")
+        _merkmale_stand["fehler"] = f.meldung
+    except Exception as f:
+        _merkmale_stand["fehler"] = f"{type(f).__name__}: {f}"[:200]
+    finally:
+        _merkmale_stand["laeuft"] = False
+
+
+@app.post("/api/merkmale/nachtragen")
+def merkmale_nachtragen_starten(x_token: str = Header(None)):
+    angemeldet(x_token)
+    with _merkmale_sperre:
+        if not _merkmale_stand["laeuft"]:
+            _merkmale_stand.update(laeuft=True, fertig=0, fehler="")
+            threading.Thread(target=merkmale_nachtragen, name="merkmale", daemon=True).start()
+    return merkmale_stand_lesen(x_token)
+
+
+@app.get("/api/merkmale/stand")
+def merkmale_stand_lesen(x_token: str = Header(None)):
+    angemeldet(x_token)
+    return {**_merkmale_stand, "offen": V.execute("SELECT COUNT(*) n FROM sachen WHERE merkmale IS NULL").fetchone()["n"]}
+
+
+# ---------------------------------------------------------------- Bauen
+
+BAUEN_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["titel", "teile", "fehlt", "hinweis"],
+                "properties": {
+                    "titel": {"type": "string"},
+                    "teile": {"type": "array", "items": {"type": "object", "additionalProperties": False,
+                                                         "required": ["id", "menge", "wofuer"],
+                                                         "properties": {"id": {"type": "integer"}, "menge": {"type": "string"},
+                                                                        "wofuer": {"type": "string"}}}},
+                    "fehlt": {"type": "array", "items": {"type": "object", "additionalProperties": False,
+                                                         "required": ["name", "menge", "wofuer"],
+                                                         "properties": {"name": {"type": "string"}, "menge": {"type": "string"},
+                                                                        "wofuer": {"type": "string"}}}},
+                    "hinweis": {"type": "string"}}}
+
+
+def _bauen_demo(idee: str, zeilen: list, en: bool) -> tuple[dict, dict]:
+    """Demo-Server (Googles Prüfer, 04.11.2026): keine KI, sondern eine Beispiel-Stückliste aus dem Bestand -- Sachen,
+    deren Name, Beschreibung oder Suchwörter einen Wortanfang der Idee enthalten, sonst drei aus der Elektrik. So ist der Ablauf bis „Als Projekt merken" zu sehen."""
+    staemme = {w[:5] for w in re.findall(r"\w{3,}", idee.lower())}
+    def text(z):
+        return " ".join([z["name"], z["beschreibung"] or "", z["woerter"] or ""]).lower()
+    passend = [z for z in zeilen if any(st in text(z) for st in staemme)][:4] or \
+        sorted(zeilen, key=lambda z: "elektr" not in (z["bereich"] or "").lower() and "electr" not in (z["bereich"] or "").lower())[:3]
+    antwort = {"titel": idee[:60] + (" (demo)" if en else " (Demo)"),
+               "teile": [{"id": z["id"], "menge": "1", "wofuer": ""} for z in passend],
+               "fehlt": [{"name": "Jumper wires" if en else "Steckbrücken", "menge": "10", "wofuer": ""}],
+               "hinweis": ("Demo server: a sample parts list from the inventory. With your own server and AI key the "
+                           "list fits your idea.") if en else ("Demo-Server: eine Beispiel-Stückliste aus dem Bestand. "
+                           "Mit eigenem Server und KI-Schlüssel passt die Liste zu deiner Idee.")}
+    return antwort, {"modell": "demo", "tokens_ein": 0, "tokens_aus": 0, "versuche": [], "rueckfall": ""}
+
+
+@app.post("/api/bauen")
+def bauen(daten: dict, request: Request, x_token: str = Header(None)):
+    """{idee} → Stückliste aus dem Bestand + was fehlt. Nur ein Vorschlag; gemerkt wird erst mit /api/bauen/merken."""
+    angemeldet(x_token)
+    idee = " ".join(str(daten.get("idee") or "").split())[:500]
+    if len(idee) < 3:
+        raise HTTPException(422, "Beschreib kurz, was du bauen willst")
+    kisten = {z["id"]: z for z in V.execute("SELECT * FROM kisten").fetchall()}
+    zeilen = [z for z in V.execute("SELECT * FROM sachen ORDER BY id").fetchall() if not _leer(z["menge"])]
+    def zeile(z):
+        mm = "; ".join(f"{m['name']}: {m['wert']}" for m in _merkmale_lesen(z))
+        return f"{z['id']}|{z['name']}|{z['menge'] or '?'}|{z['bereich']}|{mm}"
+    en = _en(request)
+    system = ("You help to plan a hobby project from the parts someone already has in their home workshop. Pick only "
+              "parts from the list (by id) that are really needed, with the quantity needed. List what is missing "
+              "separately (common parts only, no brand). titel: a short project name. hinweis: one sentence, "
+              "e.g. a caveat. Answer in English.") if en else (
+              "Du hilfst, ein Bastelprojekt aus dem zu planen, was jemand schon in seiner Werkstatt hat. Nimm aus der "
+              "Liste (per id) nur Teile, die wirklich gebraucht werden, mit der nötigen Menge. Was fehlt, extra "
+              "(gängige Teile, keine Marke). titel: kurzer Projektname. hinweis: ein Satz, z. B. eine Einschränkung. "
+              "Antworte auf Deutsch.")
+    text = f"Projekt: {idee}\n\nBestand (id|name|menge|art|eckdaten):\n" + "\n".join(zeile(z) for z in zeilen)
+    try:
+        if erkennung.demo():
+            antwort, n = _bauen_demo(idee, zeilen, en)
+        else:
+            antwort, n = erkennung.frage_json(system, text, BAUEN_SCHEMA, "bauen")
+    except erkennung.ErkennungsFehler as f:
+        _nutzung_merken(None, f.versuche, fehler_modell=erkennung.modell() if erkennung.schluessel() else "")
+        raise HTTPException(f.status, f.meldung)
+    _ki_nutzung(n)
+    nach_id = {z["id"]: z for z in zeilen}
+    teile, gesehen = [], set()
+    for t in antwort.get("teile") or []:
+        try:
+            i = int(t.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if i in nach_id and i not in gesehen:
+            gesehen.add(i)
+            teile.append({"sache": _sache_json(nach_id[i], kisten.get(nach_id[i]["kiste_id"])),
+                          "menge": str(t.get("menge") or "")[:40], "wofuer": str(t.get("wofuer") or "")[:200]})
+    fehlt = [{"name": str(f.get("name") or "")[:120], "menge": str(f.get("menge") or "")[:40],
+              "wofuer": str(f.get("wofuer") or "")[:200]} for f in antwort.get("fehlt") or [] if str(f.get("name") or "").strip()]
+    return {"titel": str(antwort.get("titel") or idee)[:120], "idee": idee, "teile": teile, "fehlt": fehlt[:20],
+            "hinweis": str(antwort.get("hinweis") or "")[:300], "modell": n["modell"]}
+
+
+@app.post("/api/bauen/merken")
+def bauen_merken(daten: dict, x_token: str = Header(None)):
+    """{name, notiz, teile: [{sache_id, menge, notiz}], fehlt: [{text, menge, notiz}]} → ein Projekt mit Stückliste."""
+    angemeldet(x_token)
+    f = _projekt_felder(daten, pflicht=True)
+    jetzt_ = db.jetzt_iso()
+    c = V.execute("INSERT INTO projekte (name, notiz, angelegt_am, geaendert_am) VALUES (?,?,?,?)",
+                  (f["name"], f.get("notiz", ""), jetzt_, jetzt_))
+    pid = c.lastrowid
+    nr = 0
+    for t in (daten.get("teile") or []) + (daten.get("fehlt") or []):
+        tf = _teil_felder({k: v for k, v in t.items() if k in ("sache_id", "text", "menge", "notiz", "link")})
+        if not tf.get("sache_id") and not tf.get("text"):
+            continue
+        nr += 1
+        V.execute("INSERT INTO projekt_teile (projekt_id, sache_id, text, menge, notiz, link, erledigt, nr) VALUES (?,?,?,?,?,?,0,?)",
+                  (pid, tf.get("sache_id"), tf.get("text", ""), tf.get("menge", ""), tf.get("notiz", ""), tf.get("link", ""), nr))
+    V.commit()
+    return _projekt_json(_projekt(pid))

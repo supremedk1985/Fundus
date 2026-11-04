@@ -14,9 +14,17 @@ only to the server address you enter. There is no account with the developer and
 - Stores boxes, rooms, stacks and shelves, items with photos, quantities, notes and projects with parts lists (SQLite + files)
 - Search by name or by purpose ("something for stripping wires")
 - QR labels for the boxes as PNG or as one PDF for any label printer
-- Optional **image recognition** with ChatGPT (OpenAI) using **your own API key** — a few cents per 100 photos
+- Optional **image recognition** with ChatGPT (OpenAI) using **your own API key** — a few cents per 100 photos; it also
+  fills a short **spec sheet** per item (type, frequency, interface, voltage …)
+- **Put away on the conveyor belt**: the app sends many photos in a row, the server recognises them one after another and
+  points out when the same thing already lies in a box (same type designation or name)
+- **Tidy up**: possible duplicates to merge (quantities and photos are added up), boxes without a place, a finer split of
+  overfull categories proposed by the AI (database backup first), spec sheets for older items
+- **Build**: describe a project idea, the AI picks the parts list from your inventory, lists what is missing and which boxes
+  to fetch; keep it as a project
 - **Shop links**: share a product link from a shop app, the server reads title, photo and details
-- **Optimize photos**: crop, brighten and remove the background, computed locally with the ISNet model (no cloud)
+- **Optimize photos**: new photos are cropped and colour-corrected automatically; removing the background stays a manual
+  step per photo — all computed locally (ISNet model, no cloud)
 
 ## Setup (Docker)
 
@@ -51,10 +59,15 @@ fundus.example.com {
 ### Image recognition
 
 Without a key you enter items by hand; everything else works. To enable recognition, create an API key at
-<https://platform.openai.com/api-keys> and either enter it in the app (**More → Image recognition**; it is stored only on
+<https://platform.openai.com/api-keys> and either enter it in the app (**Settings → Image recognition**, the gear at the top; it is stored only on
 your server) or set `OPENAI_API_KEY` in `.env`. The key in `.env` takes precedence and cannot be changed from the app.
 Default model is `gpt-4.1-mini`; another one can be chosen in the app. Each recognition sends the photo and the names of
-your categories from your server to OpenAI.
+your categories from your server to OpenAI. *Tidy up* and *Build* send item names, quantities and categories (text only).
+
+Optionally the server can ask a second AI endpoint first and fall back to OpenAI when it fails, times out or answers
+nonsense (`CLAUDE_KI_URL`, `CLAUDE_KI_SCHLUESSEL`, `CLAUDE_KI_MODELL`). The endpoint receives
+`POST {system, text, modell, zeitgrenze_s, json: true, bilder: [base64 JPEG]}` with the header `X-KI-Schluessel` and answers
+`{antwort, modell, tokens_ein, tokens_aus}`. Leave the variables empty if you do not run such a service.
 
 ### Backup and update
 
@@ -70,6 +83,7 @@ Update: `git pull && docker compose up -d --build`. The database is migrated aut
 | `PASSWORT` | Password, used on the first start only. To change it later, stop the server, delete the row in table `konto` and start again with a new `PASSWORT`. |
 | `OPENAI_API_KEY` | Optional, see above |
 | `OPENAI_MODELL` | Optional default model |
+| `CLAUDE_KI_URL`, `CLAUDE_KI_SCHLUESSEL`, `CLAUDE_KI_MODELL` | Optional second AI endpoint asked first, see above |
 | `TZ` | Time zone |
 
 ## API
@@ -114,8 +128,14 @@ In der App die Adresse (zuhause z. B. `192.168.1.20:8095`) und das Passwort eint
 einen Reverse Proxy mit HTTPS stellen (Beispiel oben) und diese Adresse eintragen.
 
 **Bilderkennung:** OpenAI-Schlüssel unter <https://platform.openai.com/api-keys> anlegen und in der App unter
-**Mehr → Bilderkennung** eintragen (wird nur auf deinem Server gespeichert) oder als `OPENAI_API_KEY` in die `.env`.
-Ohne Schlüssel trägst du Sachen von Hand ein.
+**Einstellungen → Bilderkennung** (Zahnrad oben) eintragen (wird nur auf deinem Server gespeichert) oder als `OPENAI_API_KEY` in die `.env`.
+Ohne Schlüssel trägst du Sachen von Hand ein. Mit Schlüssel erkennt der Server auch einen kurzen **Steckbrief** je Sache,
+schlägt beim **Aufräumen** eine feinere Einteilung vor und stellt beim **Bauen** aus einer Projektidee die Stückliste aus
+deinem Bestand zusammen (dafür gehen Namen, Mengen und Arten als Text an OpenAI).
+
+**Neu in Fundus 2:** Einräumen am Fließband (viele Fotos hintereinander, erkannt wird nebenher, „liegt schon in K-06 →
+dazulegen?“), Aufräumen (Doppeltes zusammenlegen, Kisten ohne Platz), Bauen, neue Fotos automatisch zugeschnitten und
+farbkorrigiert — Freistellen bleibt ein Handgriff je Foto.
 
 **Sichern:** alles liegt in `./data`. **Aktualisieren:** `git pull && docker compose up -d --build`.
 

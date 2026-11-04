@@ -11,6 +11,16 @@ import re
 FEST = {
     "Aus dem Link ließ sich nichts lesen. Du kannst die Sache von Hand eintragen.":
         "Nothing could be read from the link. You can enter the item by hand.",
+    "Claude antwortet gerade nicht, und OpenAI ist nicht eingerichtet. Gleich nochmal versuchen oder von Hand erfassen.":
+        "Claude is not answering right now and OpenAI is not set up. Try again shortly or enter the item by hand.",
+    "Es fehlen Gruppe oder Sachen": "Group or items are missing",
+    "ziel und quellen müssen Zahlen sein": "ziel and quellen must be numbers",
+    "Eine Art braucht einen Namen": "A category needs a name",
+    "Es gibt noch keine Sachen": "There are no items yet",
+    "Beschreib kurz, was du bauen willst": "Describe briefly what you want to build",
+    "Auf dem Demo-Server gibt es diese KI-Hilfe nicht.": "This AI help is not available on the demo server.",
+    "Die KI ist nicht eingerichtet oder gerade nicht erreichbar.": "The AI is not set up or not reachable right now.",
+    "Der Server erreicht die KI gerade nicht (Internet?).": "The server cannot reach the AI right now (internet?).",
     "Das Foto gehört nicht zu dieser Sache": "The photo does not belong to this item",
     "Das Foto gibt es auf dem Server nicht": "The photo does not exist on the server",
     "Das Foto ist größer als 25 MB": "The photo is larger than 25 MB",

@@ -617,3 +617,79 @@ def test_regale_mit_faechern_und_stapeln(client):
     assert d["regale"][0]["name"] == "Regal 1"
     # Küche verschiebt die Regalkiste auf einen Stapel: sie verlässt das Regal
     assert client.post("/api/kachel/fundus/kisten/K-02/verschieben", json={"raum": "Keller", "stapel": "A"}).json()["regal"] is None
+
+
+# ---------------------------------------------------------------- Claude zuerst, OpenAI als Rückfall (03.11.2026)
+
+def _weiche(client, monkeypatch, claude, openai_schluessel=True):
+    """claude: Funktion request -> httpx.Response für den Claude-Dienst. OpenAI antwortet immer mit einem Vorschlag."""
+    import erkennung
+    monkeypatch.setenv("CLAUDE_KI_URL", "http://ki.test/api/ki/claude")
+    monkeypatch.setenv("CLAUDE_KI_SCHLUESSEL", "ki-geheim")
+    if openai_schluessel:
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    gesehen = {"claude": [], "openai": 0}
+
+    def antwort(request: httpx.Request):
+        if request.url.host == "ki.test":
+            gesehen["claude"].append(json.loads(request.content) | {"_schluessel": request.headers.get("x-ki-schluessel")})
+            return claude(request)
+        gesehen["openai"] += 1
+        inhalt = {"name": "Funkmodul (OpenAI)", "beschreibung": "", "bereich": "Elektro", "menge": "1",
+                  "woerter": ["funk"], "sicherheit": "mittel"}
+        return httpx.Response(200, json={"model": "gpt-test", "choices": [{"message": {"content": json.dumps(inhalt)}}],
+                                         "usage": {"prompt_tokens": 900, "completion_tokens": 80}})
+
+    echt = erkennung.erkennen
+    monkeypatch.setattr(erkennung, "erkennen",
+                        lambda p, b, h="", en=False: echt(p, b, h, client=httpx.Client(transport=httpx.MockTransport(antwort)), en=en))
+    fid = client.post("/api/fotos", files={"datei": ("a.jpg", jpeg(), "image/jpeg")}).json()["id"]
+    return gesehen, client.post("/api/erkennen", json={"fotos": [fid]})
+
+
+def test_claude_zuerst(client, monkeypatch):
+    g, r = _weiche(client, monkeypatch, lambda q: httpx.Response(200, json={
+        "antwort": {"name": "FS1000A 433-MHz-Funksender", "beschreibung": "Sender", "bereich": "Elektro", "menge": "3",
+                    "woerter": ["Funk", "433 mhz", "funk"], "sicherheit": "sehr hoch"},
+        "modell": "claude-sonnet", "tokens_ein": 2208, "tokens_aus": 300}))
+    assert r.status_code == 200, r.text
+    v = r.json()["vorschlag"]
+    assert v["name"] == "FS1000A 433-MHz-Funksender" and v["woerter"] == ["433 mhz", "funk"] and v["sicherheit"] == "mittel"
+    assert g["openai"] == 0 and len(g["claude"]) == 1
+    k = g["claude"][0]
+    assert k["_schluessel"] == "ki-geheim" and k["modell"] == "sonnet" and len(k["bilder"]) == 1 and "JSON" in k["system"]
+    n = client.get("/api/nutzung").json()
+    assert n["claude"] is True and n["je_modell"] == [{"modell": "claude-sonnet", "anfragen": 1, "erfolgreich": 1}]
+
+
+@pytest.mark.parametrize("claude,grund", [
+    (lambda q: httpx.Response(429, json={"detail": "Das Claude-Kontingent ist gerade aufgebraucht."}), "HTTP 429"),
+    (lambda q: httpx.Response(200, json={"antwort": {"name": " ", "beschreibung": "?"}}), "ohne Namen"),
+    (lambda q: httpx.Response(200, json={"antwort": "Das ist ein Funkmodul."}), "kein Objekt"),
+    (lambda q: (_ for _ in ()).throw(httpx.ConnectError("weg")), "nicht erreichbar"),
+    (lambda q: (_ for _ in ()).throw(httpx.ReadTimeout("zu lang")), "Zeitgrenze"),
+])
+def test_rueckfall_auf_openai(client, monkeypatch, claude, grund):
+    g, r = _weiche(client, monkeypatch, claude)
+    assert r.status_code == 200, r.text
+    assert r.json()["vorschlag"]["name"] == "Funkmodul (OpenAI)" and g["openai"] == 1
+    n = client.get("/api/nutzung").json()
+    assert {m["modell"]: (m["anfragen"], m["erfolgreich"]) for m in n["je_modell"]} == {"claude-sonnet": (1, 0), "gpt-test": (1, 1)}
+    assert grund in n["rueckfaelle"][0]["grund"]
+
+
+def test_claude_weg_und_kein_openai(client, monkeypatch):
+    g, r = _weiche(client, monkeypatch, lambda q: httpx.Response(503, json={"detail": "Anmeldung abgelaufen"}), openai_schluessel=False)
+    assert r.status_code == 503 and "Claude antwortet gerade nicht" in r.json()["detail"]
+    assert g["openai"] == 0
+    assert client.get("/api/nutzung").json()["je_modell"] == [{"modell": "claude-sonnet", "anfragen": 1, "erfolgreich": 0}]
+
+
+def test_ohne_claude_bleibt_alles_wie_bisher(client, monkeypatch):
+    import erkennung
+    assert not erkennung.claude_eingerichtet()
+    monkeypatch.setenv("CLAUDE_KI_URL", "http://ki.test/x")      # ohne Schlüssel gilt Claude nicht als eingerichtet
+    assert not erkennung.claude_eingerichtet()
+    monkeypatch.setenv("DEMO", "1")
+    monkeypatch.setenv("CLAUDE_KI_SCHLUESSEL", "s")
+    assert not erkennung.claude_eingerichtet()                     # der Demo-Server fragt nie Claude

@@ -165,6 +165,13 @@ def einrichten(erstpasswort: str | None) -> None:
         neu = b[:1].upper() + b[1:]
         if neu != z["bereich"]:
             V.execute("UPDATE sachen SET bereich=? WHERE id=?", (neu, z["id"]))
+    # Steckbrief (03.11.2026, „Fundus 2"): technische Eckdaten als JSON [{name, wert}]. NULL = noch nie gefragt
+    # (dann trägt /api/merkmale/nachtragen sie aus Name und Beschreibung nach), "[]" = gefragt, nichts Sicheres.
+    if "merkmale" not in spalten:
+        V.execute("ALTER TABLE sachen ADD COLUMN merkmale TEXT")
+    # „Sind verschieden" aus der Aufräumliste: diese Gruppe nicht wieder als vielleicht doppelt zeigen -- solange
+    # sie aus genau denselben Sachen besteht (kommt eine dazu, erscheint sie wieder).
+    V.execute("CREATE TABLE IF NOT EXISTS nicht_doppelt (schluessel TEXT PRIMARY KEY, ids TEXT NOT NULL, am TEXT NOT NULL)")
     # Einstellungen, die man in der App ändern kann (01.11.2026): der OpenAI-Schlüssel und das Modell.
     V.execute("CREATE TABLE IF NOT EXISTS einstellungen (schluessel TEXT PRIMARY KEY, wert TEXT NOT NULL)")
     if erstpasswort and not V.execute("SELECT 1 FROM konto").fetchone():
